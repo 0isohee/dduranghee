@@ -159,7 +159,7 @@ textarea.inp{resize:none;min-height:78px}
 .cal{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:5px}
 .dow{text-align:center;font-size:11px;font-weight:700;color:var(--muted);padding-bottom:2px}
 .dow.sun{color:var(--miss)}
-.cell{aspect-ratio:1/1;border-radius:10px;border:1px solid transparent;background:var(--surface-2);
+.cell{position:relative;aspect-ratio:1/1;border-radius:10px;border:1px solid transparent;background:var(--surface-2);
   display:flex;align-items:center;justify-content:center;
   font-family:var(--mono);font-size:13px;font-weight:500;color:var(--muted);padding:0}
 .cell.blank{background:none}
@@ -168,6 +168,9 @@ textarea.inp{resize:none;min-height:78px}
 .cell.pending,.cell.hold{background:var(--wait-soft);border-color:var(--wait);color:var(--wait-ink);font-weight:600}
 .cell.today{background:var(--surface);border:2px dashed var(--line-strong);color:var(--ink);font-weight:600}
 .cell.future,.cell.none{background:none;color:var(--faint)}
+.bonus{position:absolute;top:-4px;right:-4px;min-width:17px;height:17px;padding:0 3px;border-radius:9px;
+  background:var(--done-ink);color:var(--on-accent);font-family:var(--mono);font-size:9.5px;font-weight:600;
+  display:flex;align-items:center;justify-content:center;box-shadow:0 0 0 1.5px var(--surface)}
 .legend{display:flex;flex-wrap:wrap;gap:10px 14px}
 .legend span{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;color:var(--muted)}
 .sw{width:12px;height:12px;border-radius:4px;border:1px solid transparent;flex:0 0 auto}
@@ -279,7 +282,7 @@ const S = {
   ym:curYm(), tab:'cal', filter:'all',
   sheet:null, sheetData:null,
   newAcct:null, confirmRm:null, acctOpen:false,
-  draft:{photos:[],caption:'',avatar:null,name:null,goal:undefined,goalYm:null,slot:0},
+  draft:{photos:[],caption:'',value:'',avatar:null,name:null,goal:undefined,goalYm:null,slot:0},
   busy:'', flash:'', subs:[], msubs:[]
 };
 
@@ -336,17 +339,35 @@ const member = id => members()[id] || null;
 const goals = () => (S.monthDoc && S.monthDoc.goals) || {};
 const goalOf = id => goals()[id] || null;
 const myGoal = () => goalOf(S.mid);
+/* 방에 나 말고 아무도 없으면 확인해줄 사람이 없으므로 0명 — 올리는 즉시 달성입니다.
+   가족이 들어오면 목표에 저장된 설정이 그때부터 적용됩니다. */
+const otherCount = id => memberIds().filter(x => x !== id).length;
 function neededFor(id){
+  const others = otherCount(id);
+  if(others === 0) return 0;
   const g = goalOf(id); if(!g) return 1;
-  const others = Math.max(1, memberIds().length-1);
-  if(g.reviewers===0 || g.reviewers==='all') return others;
-  return clamp(+g.reviewers||1, 1, others);
+  if(g.reviewers === 0 || g.reviewers === 'all') return others;
+  return clamp(+g.reviewers || 1, 1, others);
 }
 const postId = (ds,id) => ds+'_'+id;
 const postOf = (id,ds) => S.posts.find(p => p.mid===id && p.date===ds) || null;
 const nApprove = p => Object.values((p&&p.approvals)||{}).filter(Boolean).length;
 const nHold = p => Object.values((p&&p.holds)||{}).filter(Boolean).length;
 const joinDs = id => { const m=member(id); return m&&m.joinedAt ? dstrOf(new Date(m.joinedAt)) : null; };
+
+/* 점수는 달성률에 정확히 비례합니다. 목표 30분에 55분이면 1.8배 → +1.8점.
+   목표치에 못 미친 날은 확인 여부와 상관없이 -1점입니다. */
+const r1 = n => Math.round(n*10)/10;
+const fmtNum = n => { const v = r1(n); return Number.isInteger(v) ? String(v) : v.toFixed(1); };
+const fmtPt = n => { const v = r1(n); return (v>0?'+':'') + fmtNum(v); };
+function ratioOf(id, p){
+  const g = goalOf(id);
+  const t = parseFloat(g && g.target);
+  const v = parseFloat(p && p.value);
+  if(!isFinite(t) || t <= 0 || !isFinite(v)) return null;
+  return v / t;
+}
+const isShort = (id, p) => { const r = ratioOf(id, p); return r !== null && r < 1; };
 
 function statusOf(id, ds){
   const td = today();
@@ -355,21 +376,31 @@ function statusOf(id, ds){
   const jd = joinDs(id); if(jd && ds < jd) return 'none';
   const p = postOf(id, ds);
   if(p){
+    if(isShort(id, p)) return 'miss';
     if(nApprove(p) >= neededFor(id)) return 'done';
     if(nHold(p) > 0) return ds===td ? 'hold' : 'miss';
     return ds===td ? 'pending' : 'miss';
   }
   return ds===td ? 'today' : 'miss';
 }
+function pointsOf(id, ds){
+  const st = statusOf(id, ds);
+  if(st === 'done'){
+    const r = ratioOf(id, postOf(id, ds));
+    return r === null ? 1 : Math.max(1, r1(r));
+  }
+  return st === 'miss' ? -1 : 0;
+}
 function statsOf(id){
   const n = dim(S.ym);
-  let done=0, miss=0, pend=0, best=0, run=0;
+  let done=0, miss=0, pend=0, best=0, run=0, score=0, bonus=0;
   for(let d=1; d<=n; d++){
-    const st = statusOf(id, S.ym+'-'+p2(d));
-    if(st==='done'){ done++; run++; if(run>best) best=run; }
+    const ds = S.ym+'-'+p2(d), st = statusOf(id, ds);
+    score += pointsOf(id, ds);
+    if(st==='done'){ done++; run++; if(run>best) best=run; if(pointsOf(id,ds) > 1) bonus++; }
     else { if(st==='miss') miss++; if(st==='pending'||st==='hold') pend++; run=0; }
   }
-  return {done, miss, pend, score:done-miss, streak:best};
+  return {done, miss, pend, score:r1(score), streak:best, bonus};
 }
 function ranked(){
   const out = memberIds().map(id => Object.assign(statsOf(id), {id}));
@@ -504,20 +535,20 @@ async function doSaveGoal(ym, g){
   }catch(e){ say(failMsg(e)); }
   S.busy=''; render();
 }
-async function doPost(ds, caption, photos){
+async function doPost(ds, caption, photos, value){
   const pid = postId(ds, S.mid);
   const existing = postOf(S.mid, ds);
   if(S.demo){
-    if(existing){ existing.caption=caption; existing.photos=photos; }
-    else S.posts.push({id:pid, mid:S.mid, date:ds, month:ds.slice(0,7), caption, photos,
+    if(existing){ existing.caption=caption; existing.photos=photos; existing.value=value; }
+    else S.posts.push({id:pid, mid:S.mid, date:ds, month:ds.slice(0,7), caption, photos, value,
       createdAt:Date.now(), approvals:{}, holds:{}, comments:[]});
     closeSheet(); say('인증을 올렸어요. 가족의 확인을 기다려요.'); return;
   }
   S.busy='post'; render();
   try{
-    if(existing) await S.fb.fs.updateDoc(F.postRef(pid), {caption, photos, createdAt:Date.now()});
+    if(existing) await S.fb.fs.updateDoc(F.postRef(pid), {caption, photos, value, createdAt:Date.now()});
     else await S.fb.fs.setDoc(F.postRef(pid), {
-      mid:S.mid, date:ds, month:ds.slice(0,7), caption, photos,
+      mid:S.mid, date:ds, month:ds.slice(0,7), caption, photos, value,
       createdAt:Date.now(), approvals:{}, holds:{}, comments:[]
     });
     closeSheet(); say('인증을 올렸어요. 가족의 확인을 기다려요.');
@@ -598,8 +629,7 @@ function demoInit(){
     dad:{title:'계단으로 출퇴근', target:'10', unit:'층', reviewers:1},
     sis:{title:'영어 단어 외우기', target:'20', unit:'개', reviewers:1}
   }};
-  const caps = {me:'하루 30분 걷기 / 목표 30분 · 오늘 42분', mom:'아침 요가 / 목표 20분 · 오늘 25분',
-    dad:'계단으로 출퇴근 / 목표 10층 · 오늘 12층', sis:'영어 단어 외우기 / 목표 20개 · 오늘 25개'};
+
   const rate = {me:0.78, mom:0.9, dad:0.6, sis:0.7};
   const td = today(), n = dim(S.ym);
   S.posts = [];
@@ -613,7 +643,13 @@ function demoInit(){
         const other = memberIds().find(o => o !== id);
         if(other) appr[other] = 1;
       }
-      S.posts.push({id:postId(ds,id), mid:id, date:ds, month:S.ym, caption:caps[id],
+      const gg = S.monthDoc.goals[id];
+      const tgt = parseFloat(gg.target) || 1;
+      const mult = 1 + ((d + k) % 4) * 0.4;
+      const vv = Math.round(tgt*mult*10)/10;
+      S.posts.push({id:postId(ds,id), mid:id, date:ds, month:S.ym,
+        caption: gg.title+' / 목표 '+gg.target+gg.unit+' · 오늘 '+vv+gg.unit,
+        value: vv,
         photos:[{}], createdAt:Date.parse(ds+'T12:00:00')||Date.now(),
         approvals:appr, holds:{},
         comments: d%6===0 ? [{id:rnd(6), mid:'mom', text:'오늘도 잘했어요', at:Date.now()}] : []});
@@ -735,6 +771,27 @@ function avatar(id, size){
   return '<span class="'+cls+'" aria-hidden="true">'+esc(initial(m.name))+'</span>';
 }
 const nameOf = id => { const m = member(id); return m ? m.name : '알 수 없음'; };
+function achRow(p){
+  const g = goalOf(p.mid) || {};
+  const r = ratioOf(p.mid, p);
+  if(r === null) return '';
+  return '<span class="row g8" style="width:100%;font-size:11.5px;color:var(--muted)">'+
+    '<span class="grow num">오늘 '+esc(String(p.value))+esc(g.unit||'')+' / 목표 '+esc(String(g.target))+esc(g.unit||'')+'</span>'+
+    '<span class="pill '+(r>=1?'done':'miss')+'">달성률 '+Math.round(r*100)+'%</span>'+
+  '</span>';
+}
+function valPreviewHtml(){
+  const g = myGoal() || {};
+  const v = parseFloat(S.draft.value), t = parseFloat(g.target);
+  if(!isFinite(v) || !isFinite(t) || t <= 0)
+    return '<span class="tiny">목표치 대비 달성률만큼 점수를 받아요.</span>';
+  const pct = Math.round(v/t*100);
+  if(v/t < 1)
+    return '<span class="tiny" style="color:var(--miss-ink)">달성률 '+pct+'% — 목표치에 못 미쳐서 <strong>-1점</strong>으로 기록돼요.</span>';
+  const pt = fmtPt(Math.max(1, r1(v/t)));
+  return '<span class="tiny" style="color:var(--done-ink)">달성률 '+pct+'% — '+
+    (neededFor(S.mid)===0 ? '올리면 바로 <strong>'+pt+'점</strong>이에요.' : '가족이 확인하면 <strong>'+pt+'점</strong>을 받아요.')+'</span>';
+}
 const statusKo = s => ({done:'달성', miss:'미달성', pending:'검토 대기', hold:'보류됨', today:'아직 안 함', future:'', none:'목표 없음'}[s] || '');
 const pillClass = s => s==='done' ? 'done' : s==='miss' ? 'miss' : (s==='pending'||s==='hold') ? 'wait' : 'flat';
 
@@ -889,6 +946,9 @@ function goalForm(g, pre){
     '<div class="stack g7">'+
       '<span class="field-l">몇 명이 확인해주면 달성으로 인정할까요</span>'+
       '<div class="seg">'+ch(1,'1명')+ch(2,'2명')+ch(0,'가족 전원')+'</div>'+
+      (otherCount(S.mid)===0
+        ? '<p class="tiny">지금은 방에 나 혼자라 확인해줄 사람이 없어요. 인증을 올리면 <strong style="color:var(--ink)">바로 달성으로 기록</strong>되고, 가족이 들어오면 이 설정이 적용됩니다.</p>'
+        : '')+
     '</div>'+
     '<div class="card stack g10" style="background:var(--surface-2)">'+
       '<div class="row g8">'+
@@ -898,12 +958,12 @@ function goalForm(g, pre){
       '</div>'+
       '<p style="font-size:12.5px;line-height:1.6;color:var(--muted)">사진은 <strong style="color:var(--ink)">최대 2장</strong>까지 첨부할 수 있어요. <strong style="color:var(--ink)">캡션에 목표와 목표치를 반드시</strong> 적어야 하고, 사진에도 목표치가 드러나게 찍어야 해요.</p>'+
       '<div class="row g10" style="align-items:flex-start">'+
-        '<span class="num" style="font-size:15px;font-weight:600;color:var(--done);width:26px;text-align:center">+1</span>'+
-        '<span style="font-size:12.5px;color:var(--muted)">가족이 확인해준 날</span>'+
+        '<span class="num" style="font-size:15px;font-weight:600;color:var(--done);width:34px;text-align:center">+1</span>'+
+        '<span style="font-size:12.5px;color:var(--muted)">목표치를 채우고 가족이 확인해준 날. <strong style="color:var(--ink)">2배 하면 +2점</strong>, 1.8배면 +1.8점으로 달성률만큼 받아요.</span>'+
       '</div>'+
       '<div class="row g10" style="align-items:flex-start">'+
-        '<span class="num" style="font-size:15px;font-weight:600;color:var(--miss);width:26px;text-align:center">-1</span>'+
-        '<span style="font-size:12.5px;color:var(--muted)">자정까지 인증이 없거나, 목표치에 못 미친 날</span>'+
+        '<span class="num" style="font-size:15px;font-weight:600;color:var(--miss);width:34px;text-align:center">-1</span>'+
+        '<span style="font-size:12.5px;color:var(--muted)">자정까지 인증이 없거나, 달성치가 목표치에 못 미친 날</span>'+
       '</div>'+
     '</div>'+
   '</div>';
@@ -963,8 +1023,9 @@ function tabCal(){
   let grid = '';
   for(let i=0;i<lead;i++) grid += '<div class="cell blank"></div>';
   for(let d=1;d<=n;d++){
-    const ds = S.ym+'-'+p2(d), s = statusOf(S.mid, ds);
-    grid += '<button class="cell '+s+'" data-act="day" data-v="'+ds+'" aria-label="'+d+'일 '+statusKo(s)+'">'+d+'</button>';
+    const ds = S.ym+'-'+p2(d), s = statusOf(S.mid, ds), pt = pointsOf(S.mid, ds);
+    const bonus = (s==='done' && pt > 1) ? '<span class="bonus">'+fmtNum(pt)+'</span>' : '';
+    grid += '<button class="cell '+s+'" data-act="day" data-v="'+ds+'" aria-label="'+d+'일 '+statusKo(s)+(s==='done'?', '+fmtPt(pt)+'점':'')+'">'+d+bonus+'</button>';
   }
   const mine = postOf(S.mid, td), mineSt = statusOf(S.mid, td), hm = hoursToMidnight();
   const chips = memberIds().map(id => {
@@ -980,10 +1041,10 @@ function tabCal(){
       '<div class="grow stack" style="gap:3px">'+
         '<span class="lbl">'+esc(nameOf(S.mid))+'의 '+(+S.ym.split('-')[1])+'월 목표</span>'+
         '<span style="font-size:15.5px;font-weight:700">'+esc(g?g.title:'목표가 없어요')+'</span>'+
-        (g?'<span class="tiny">하루 목표치 '+esc(g.target||'-')+esc(g.unit||'')+' · 확인 '+neededFor(S.mid)+'명</span>':'')+
+        (g?'<span class="tiny">하루 목표치 '+esc(g.target||'-')+esc(g.unit||'')+' · '+(neededFor(S.mid)===0?'자동 확인':'확인 '+neededFor(S.mid)+'명')+'</span>':'')+
       '</div>'+
       '<div class="stack" style="align-items:flex-end;gap:1px">'+
-        '<span class="num hero" style="font-size:26px;color:'+(st.score<0?'var(--miss)':'var(--done)')+'">'+(st.score>0?'+':'')+st.score+'</span>'+
+        '<span class="num hero" style="font-size:26px;color:'+(st.score<0?'var(--miss)':'var(--done)')+'">'+fmtPt(st.score)+'</span>'+
         '<span class="tiny">'+memberIds().length+'명 중 '+myRank+'위</span>'+
       '</div>'+
     '</div>'+
@@ -1042,8 +1103,8 @@ function postCard(p){
         '<span style="font-size:13.5px;font-weight:700">'+esc(nameOf(p.mid))+'</span>'+
         '<span class="tiny">'+esc(dLabel(p.date))+' · '+esc(g?g.title:'목표 없음')+'</span>'+
       '</span>'+
-      '<span class="pill '+pillClass(s)+'">'+(s==='done'?'달성 +1':statusKo(s))+'</span>'+
-    '</span>'+ shotHtml +
+      '<span class="pill '+pillClass(s)+'">'+(s==='done'? fmtPt(pointsOf(p.mid, p.date))+'점' : statusKo(s))+'</span>'+
+    '</span>'+ shotHtml + achRow(p) +
     (p.caption?'<span style="font-size:13px;line-height:1.55">'+esc(p.caption)+'</span>':'')+
     '<span class="row g14" style="font-size:11.5px;color:var(--muted)">'+
       '<span class="row" style="gap:5px">'+ICON.check+'확인 '+ap+' / '+need+'</span>'+
@@ -1075,11 +1136,11 @@ function tabRank(){
           '<span style="font-size:13.5px;font-weight:700">'+esc(nameOf(x.id))+(x.id===S.mid?' <span class="tiny">(나)</span>':'')+'</span>'+
           '<span class="tiny" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(g?g.title+' · 목표 '+(g.target||'-')+(g.unit||''):'목표 없음')+'</span>'+
         '</span>'+
-        '<span class="num" style="font-size:18px;font-weight:600;color:'+(x.score<0?'var(--miss)':'var(--ink)')+'">'+(x.score>0?'+':'')+x.score+'</span>'+
+        '<span class="num" style="font-size:18px;font-weight:600;color:'+(x.score<0?'var(--miss)':'var(--ink)')+'">'+fmtPt(x.score)+'</span>'+
       '</div>'+
       '<div class="row g10">'+
         '<span class="track grow"><span class="fill" style="width:'+pct+'%"></span></span>'+
-        '<span class="tiny num" style="flex:0 0 auto">달성 '+x.done+' · 미달성 '+x.miss+'</span>'+
+        '<span class="tiny num" style="flex:0 0 auto">달성 '+x.done+' · 미달성 '+x.miss+(x.bonus?' · 초과달성 '+x.bonus:'')+'</span>'+
       '</div>'+
     '</div>';
   }).join('');
@@ -1113,9 +1174,9 @@ function tabRank(){
     '</div>'+
     '<div class="row g8" style="align-items:baseline">'+
       '<h2 class="grow" style="font-size:14px;font-weight:700">'+(isCur?'현재 순위':'최종 순위')+'</h2>'+
-      '<span class="tiny">'+(S.demo?'예시 데이터':'실시간')+' · 점수 = 달성 − 미달성</span>'+
+      '<span class="tiny">'+(S.demo?'예시 데이터':'실시간')+' · 달성률만큼 더하고 미달성은 1점씩 빼요</span>'+
     '</div>'+ rows +
-    (champ && champ.score>0 ? '<div class="note info">'+ICON.medal+'<span><strong>'+esc(nameOf(champ.id))+'</strong>님이 '+esc(ymLabel(S.ym))+' 1등이에요 — '+(champ.score>0?'+':'')+champ.score+'점, '+champ.done+'일 달성.</span></div>' : '')+
+    (champ && champ.score>0 ? '<div class="note info">'+ICON.medal+'<span><strong>'+esc(nameOf(champ.id))+'</strong>님이 '+esc(ymLabel(S.ym))+' 1등이에요 — '+fmtPt(champ.score)+'점, '+champ.done+'일 달성.</span></div>' : '')+
     '<div class="divider"></div>'+
     '<div class="row g8" style="align-items:baseline">'+
       '<h2 class="grow" style="font-size:14px;font-weight:700">사람별 기록</h2>'+
@@ -1150,7 +1211,7 @@ function tabGoal(){
           '<span style="font-size:13.5px;font-weight:700">'+esc(nameOf(id))+'</span>'+
           '<span class="tiny" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(mg?mg.title+' · 목표 '+(mg.target||'-')+(mg.unit||''):'아직 목표를 정하지 않았어요')+'</span>'+
         '</span>'+
-        '<span class="num" style="font-weight:600;color:'+(s.score<0?'var(--miss)':'var(--done)')+'">'+(s.score>0?'+':'')+s.score+'</span>'+
+        '<span class="num" style="font-weight:600;color:'+(s.score<0?'var(--miss)':'var(--done)')+'">'+fmtPt(s.score)+'</span>'+
       '</div>';
     }).join('')+
     '<div class="divider"></div>'+
@@ -1269,12 +1330,27 @@ function sheetVerify(){
         '<p class="tiny">사진에 <strong style="color:var(--ink)">목표치'+(g.target?'('+esc(g.target)+esc(g.unit||'')+')':'')+'가 드러나게</strong> 찍어주세요.</p>'+
         '<div class="shots">'+slots+'</div>'+
       '</div>'+
+      '<div class="stack g7">'+
+        '<div class="row g10" style="align-items:flex-end">'+
+          '<div class="grow stack g6">'+
+            '<label class="field-l" for="i-val">오늘 달성치 <span style="color:var(--miss)">(필수)</span></label>'+
+            '<input class="inp" id="i-val" type="text" inputmode="decimal" autocomplete="off" value="'+esc(S.draft.value)+'" placeholder="'+esc(g.target||'')+'">'+
+          '</div>'+
+          '<div class="stack g6" style="width:104px;flex:0 0 auto">'+
+            '<span class="field-l">오늘 목표</span>'+
+            '<div class="inp num" style="display:flex;align-items:center;background:var(--surface-2);color:var(--muted)">'+esc(g.target||'-')+esc(g.unit||'')+'</div>'+
+          '</div>'+
+        '</div>'+
+        '<span id="valpreview">'+valPreviewHtml()+'</span>'+
+      '</div>'+
       '<div class="stack g6">'+
         '<label class="field-l" for="i-cap">캡션 <span style="color:var(--miss)">(필수)</span> <span style="font-weight:400;color:var(--muted)">· 목표와 목표치를 꼭 적어주세요</span></label>'+
         '<textarea class="inp'+(needTarget?' need':'')+'" id="i-cap" placeholder="'+esc((g.title||'목표')+' / 목표 '+(g.target||'')+(g.unit||'')+' · 오늘 ')+'">'+esc(cap)+'</textarea>'+
         (needTarget?'<span class="tiny" style="color:var(--miss-ink)">캡션에 목표치 '+esc(g.target)+esc(g.unit||'')+'를 넣어주세요.</span>':'')+
       '</div>'+
-      '<div class="note info">'+ICON.info+'<span>올리면 가족 피드에 올라가요. <strong>'+neededFor(S.mid)+'명이 확인해주면 달성 +1점</strong>, 자정까지 확인이 없으면 -1점이에요.</span></div>'+
+      '<div class="note info">'+ICON.info+'<span>'+(neededFor(S.mid)===0
+        ? '지금은 방에 나 혼자라 <strong>올리는 즉시 달성률만큼 점수</strong>로 기록돼요. 가족이 들어오면 서로 확인해주는 방식으로 바뀝니다.'
+        : '올리면 가족 피드에 올라가요. <strong>'+neededFor(S.mid)+'명이 확인해주면 달성률만큼 점수</strong>를 받고, 자정까지 확인이 없으면 -1점이에요.')+'</span></div>'+
       '<input type="file" accept="image/*" class="sr" id="f-shot">'+
     '</div>'+
     '<div class="foot">'+
@@ -1303,24 +1379,30 @@ function sheetDetail(){
           '<span style="font-size:14.5px;font-weight:700">'+esc(nameOf(p.mid))+(mine?' <span class="tiny">(나)</span>':'')+'</span>'+
           '<span class="tiny">'+esc(dLabel(p.date))+' · '+esc(g.title||'목표 없음')+(g.target?' · 목표 '+esc(g.target)+esc(g.unit||''):'')+'</span>'+
         '</span>'+
-        '<span class="pill '+pillClass(s)+'">'+(s==='done'?'달성 +1':statusKo(s))+'</span>'+
+        '<span class="pill '+pillClass(s)+'">'+(s==='done'? fmtPt(pointsOf(p.mid, p.date))+'점' : statusKo(s))+'</span>'+
       '</div>'+
       (shots.length?'<div class="shots">'+shots.map(ph => {
         const src = shotSrc(ph);
         return '<div class="shot">'+(src?'<img src="'+esc(src)+'" alt="인증 사진">':'<span class="ph">사진</span>')+'</div>';
       }).join('')+'</div>':'')+
+      achRow(p)+
       (p.caption?'<p style="font-size:13.5px;line-height:1.6">'+esc(p.caption)+'</p>':'')+
       '<div class="card stack g10">'+
         '<div class="row g8" style="align-items:baseline">'+
-          '<h3 class="grow" style="font-size:13.5px;font-weight:700">가족 확인 <span class="num" style="color:var(--done)">'+ap+'</span> / '+need+'명 필요</h3>'+
+          '<h3 class="grow" style="font-size:13.5px;font-weight:700">'+(need===0
+            ? '자동 확인됨'
+            : '가족 확인 <span class="num" style="color:var(--done)">'+ap+'</span> / '+need+'명 필요')+'</h3>'+
           (hd?'<span class="pill miss">보류 '+hd+'</span>':'')+
         '</div>'+
         (approvers.length?'<div class="row" style="gap:0;flex-wrap:wrap">'+approvers.slice(0,6).map((id,i) =>
           '<span style="margin-left:'+(i?'-8px':'0')+';border-radius:50%;box-shadow:0 0 0 2px var(--surface)">'+avatar(id,28)+'</span>').join('')+
           '<span class="tiny" style="margin-left:8px">'+esc(approvers.map(nameOf).join(', '))+' 확인</span></div>':'')+
-        (mine
+        (need===0
+          ? '<p class="tiny">방에 나 혼자라 확인해줄 사람이 없어서, 올린 즉시 달성으로 기록됐어요.</p>'
+          : mine
           ? '<p class="tiny">내 인증은 직접 확인할 수 없어요. 가족의 확인을 기다려요.</p>'
-          : '<p class="tiny">확인해주면 '+esc(nameOf(p.mid))+'님의 '+esc(dLabel(p.date))+'이 달성 +1점으로 기록돼요.</p>'+
+          : '<p class="tiny">확인해주면 '+esc(nameOf(p.mid))+'님의 '+esc(dLabel(p.date))+'이 '+
+            (ratioOf(p.mid,p)!==null ? '<strong>'+fmtPt(Math.max(1, r1(ratioOf(p.mid,p))))+'점</strong>' : '달성 +1점')+'으로 기록돼요.</p>'+
             '<div class="row g8">'+
               '<button class="btn sm" data-act="ok" style="flex:2 1 0'+(myA?';background:var(--done-ink)':'')+'"'+(S.busy==='review'?' disabled':'')+'>'+ICON.check+(myA?'확인했어요':'인증 확인')+'</button>'+
               '<button class="btn ghost sm" data-act="hold" style="flex:1 1 0'+(myH?';border-color:var(--miss);color:var(--miss-ink)':'')+'"'+(S.busy==='review'?' disabled':'')+'>'+(myH?'보류 중':'보류')+'</button>'+
@@ -1370,12 +1452,13 @@ function openSheet(name, data){
     const ex = postOf(S.mid, today()), g = myGoal() || {};
     S.draft.photos = ex && ex.photos ? ex.photos.slice(0,2).filter(p => p && p.d) : [];
     S.draft.caption = ex ? (ex.caption||'') : ((g.title||'') + (g.target ? ' / 목표 '+g.target+(g.unit||'') : '') + ' · 오늘 ');
+    S.draft.value = ex && ex.value != null ? String(ex.value) : '';
   }
   render();
 }
 function closeSheet(){
   S.sheet = null; S.sheetData = null;
-  S.draft.photos = []; S.draft.caption = '';
+  S.draft.photos = []; S.draft.caption = ''; S.draft.value = '';
   render();
 }
 function selectText(id, msg){
@@ -1484,13 +1567,14 @@ document.addEventListener('click', ev => {
   if(act==='pickshot'){ S.draft.slot = +v; const f = document.getElementById('f-shot'); if(f) f.click(); return; }
   if(act==='rmshot'){ S.draft.caption = val('i-cap'); S.draft.photos.splice(+v,1); render(); return; }
   if(act==='submit'){
-    const cap = val('i-cap'), g = myGoal() || {};
+    const cap = val('i-cap'), vv = val('i-val'), g = myGoal() || {};
     if(!S.draft.photos.length){ say('사진을 최소 1장 올려주세요.'); return; }
+    if(!vv || !isFinite(parseFloat(vv))){ say('오늘 달성치를 숫자로 넣어주세요.'); return; }
     if(!cap){ say('캡션은 필수예요. 목표와 목표치를 적어주세요.'); return; }
     if(g.target && cap.indexOf(String(g.target))===-1){
       S.draft.caption = cap; say('캡션에 목표치 '+g.target+(g.unit||'')+'를 넣어주세요.'); render(); return;
     }
-    doPost(today(), cap, S.draft.photos.slice(0,2)); return;
+    doPost(today(), cap, S.draft.photos.slice(0,2), parseFloat(vv)); return;
   }
   if(act==='ok' || act==='hold'){
     const p = S.posts.find(x => x.id===S.sheetData);
@@ -1529,6 +1613,11 @@ document.addEventListener('change', async ev => {
   }
 });
 document.addEventListener('input', ev => {
+  if(ev.target.id==='i-val'){
+    S.draft.value = ev.target.value;
+    const box = document.getElementById('valpreview');
+    if(box) box.innerHTML = valPreviewHtml();
+  }
   if(ev.target.id==='i-cap') S.draft.caption = ev.target.value;
   if(ev.target.id==='i-name') S.draft.name = ev.target.value;
 });
